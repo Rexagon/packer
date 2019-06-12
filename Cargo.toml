@@ -1,0 +1,9 @@
+[package]
+name = "packer"
+version = "0.1.0"
+authors = ["Rexagon <reide740@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+libflate = "0.1"
+yaml-rust = "0.4"

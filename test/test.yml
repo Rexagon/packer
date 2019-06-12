@@ -1,0 +1,9 @@
+---
+
+output: textures.pak
+content:
+  - ../src
+  - source: 'test.yml'
+    another: 'asd.yml'
+
+...
