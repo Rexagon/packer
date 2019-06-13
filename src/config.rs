@@ -1,8 +1,11 @@
+use std::path::Path;
+
 use yaml_rust::{YamlLoader, Yaml};
 
 #[derive(Debug)]
 pub struct Config {
     pub output: String,
+    pub base: Option<String>,
     pub content: Vec<ContentItem>,
 }
 
@@ -17,7 +20,7 @@ pub enum ContentItem {
     },
 }
 
-pub fn parse_configs(path: &str) -> Result<Vec<Config>, String> {
+pub fn parse_configs(path: &Path) -> Result<Vec<Config>, String> {
     let docs = {
         let config = match std::fs::read_to_string(path) {
             Ok(data) => data,
@@ -41,9 +44,11 @@ enum ParsedContentItem {
 
 fn parse_document(doc: &Yaml) -> Result<Config, String> {
     let output = match doc["output"].as_str() {
-        Some(path) => path,
+        Some(path) => String::from(path),
         None => return Err(format!("'output' must be specified in config"))
     };
+
+    let base = doc["base"].as_str().map(String::from);
 
     let content = match doc["content"].as_vec() {
         Some(arr) => arr,
@@ -75,7 +80,8 @@ fn parse_document(doc: &Yaml) -> Result<Config, String> {
         .collect();
 
     Ok(Config {
-        output: String::from(output),
+        output,
+        base,
         content: content?,
     })
 }
