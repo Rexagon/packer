@@ -4,6 +4,6 @@ base: ../
 output: test.pak
 content:
   - 'src/*.rs'
-  - 'target/**/*'
+  - 'test/*.yml'
 
 ...
