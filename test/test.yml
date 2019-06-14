@@ -1,11 +1,9 @@
 ---
 
-output: textures.pak
 base: ../
+output: test.pak
 content:
   - 'src/*.rs'
-  - '.git/**/*'
-  - source: '/**/*'
-    another: 'asd.yml'
+  - 'target/**/*'
 
 ...

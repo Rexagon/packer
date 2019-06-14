@@ -1,37 +1,35 @@
 mod config;
 
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{OpenOptions, File};
+use std::convert::TryFrom;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use bytes::BufMut;
+use byteorder::{LE, WriteBytesExt};
 use libflate::zlib::Encoder;
+use path_slash::{PathBufExt, PathExt};
 use globwalk::{GlobWalkerBuilder, DirEntry, WalkError};
 
 use config::*;
+use std::error::Error;
 
 #[derive(Debug)]
-struct Header<'a> {
-    items: Vec<HeaderItem<'a>>
-}
-
-impl<'a> Header<'a> {
-    fn finalize(header: &mut Header) {
-        let mut offset = 0;
-    }
+struct Header {
+    items: Vec<HeaderItem>
 }
 
 #[derive(Debug)]
-struct HeaderItem<'a> {
+struct HeaderItem {
     path: PathBuf,
-    name: Option<&'a str>,
+    name: Option<String>,
+    header_offset: Option<usize>,
     data_offset: Option<u64>,
     data_length: Option<u64>,
 }
 
-impl<'a> HeaderItem<'a> {
-    fn new(path: PathBuf) -> Result<HeaderItem<'a>, String> {
+impl HeaderItem {
+    fn new(path: PathBuf) -> Result<HeaderItem, String> {
         if let None = path.to_str() {
             return Err(format!("File name is invalid UTF-8 string"));
         }
@@ -39,33 +37,69 @@ impl<'a> HeaderItem<'a> {
         Ok(HeaderItem {
             path,
             name: None,
+            header_offset: None,
             data_offset: None,
             data_length: None,
         })
     }
 
     fn length(&self) -> usize {
-        let name = match self.name {
+        let name = match self.name.as_ref() {
             Some(name) => name,
             None => return 0
         };
 
-        std::mem::size_of::<u16>() +                        // name length
+        std::mem::size_of::<u64>() +                        // data offset
+            std::mem::size_of::<u64>() +                    // data length
+            std::mem::size_of::<u16>() +                    // name length
             name.as_bytes().len() +                         // name
             std::mem::size_of::<u16>() +                    // path length
-            self.path.to_str().unwrap().as_bytes().len() +  // path
-            std::mem::size_of::<u64>() +                    // data offset
-            std::mem::size_of::<u64>()                      // data length
+            self.path.to_str().unwrap().as_bytes().len()    // path
     }
 
-    fn write(&self, buf: &mut BufMut) {
+    fn write(&mut self, pos: usize, file: &mut File) -> Result<usize, String> {
+        fn err_mapper(e: impl Error) -> String {
+            e.to_string()
+        }
+
+        let name = match self.name.as_ref() {
+            Some(name) => name,
+            None => return Err(format!("Header item name not specified"))
+        };
+
+        self.header_offset = Some(pos);
+
+        // TODO: force all operations to be in little endian format
+
+        // write offset
+        file.write_u64::<LE>(self.data_offset.unwrap_or(0)).map_err(err_mapper);
+
+        // write length
+        file.write_u64::<LE>(self.data_length.unwrap_or(0)).map_err(err_mapper);
+
+        // write name
+        let name_length = u16::try_from(name.len())
+            .map_err(|_| format!("Name string is too long"))?;
+
+        file.write_u16::<LE>(name_length).map_err(err_mapper);
+        file.write_all(name.as_bytes()).map_err(err_mapper);
+
+        // write path
+        let path = self.path.to_str().unwrap();
+        let path_length = u16::try_from(path.len())
+            .map_err(|_| format!("Path string is too long"))?;
+
+        file.write_u16::<LE>(path_length).map_err(err_mapper);
+        file.write_all(path.as_bytes()).map_err(err_mapper);
+
+        Ok(pos + self.length())
     }
 }
 
-fn create_header<'a>(base_directory: &Path, config: &Config) -> Result<Header<'a>, String> {
+fn create_header(base_directory: &Path, config: &Config) -> Result<Header, String> {
     let mut named_items = vec![];
 
-    let items = config.content.iter()
+    let mut items: Vec<HeaderItem> = config.content.iter()
         .filter_map(|item| {
             let pattern = match item {
                 ContentItem::Unnamed { pattern } => pattern,
@@ -97,12 +131,32 @@ fn create_header<'a>(base_directory: &Path, config: &Config) -> Result<Header<'a
                 })
                 .chain(r)
         })
+        .filter(|entry| {
+            if let Ok(entry) = entry {
+                entry.path().is_file()
+            } else {
+                true
+            }
+        })
         .map(|entry| -> Result<HeaderItem, String> {
             Ok(HeaderItem::new(entry?.into_path())?)
         })
         .collect::<Result<Vec<HeaderItem>, String>>()?;
 
-    // TODO: update items and append named
+    // TODO: append named
+
+    for i in 0..items.len() {
+        let path = path_relative_from(items[i].path.as_path(), base_directory);
+        let path = match path {
+            Some(path) => path,
+            None => return Err(format!("Unable to create relative path"))
+        };
+
+        items[i].name = Some(match path.to_slash() {
+            Some(path) => path,
+            None => return Err(format!("Unable to convert file name to slashed form"))
+        });
+    }
 
     Ok(Header {
         items
@@ -149,31 +203,20 @@ fn path_relative_from(path: &Path, base: &Path) -> Option<PathBuf> {
     }
 }
 
-fn main() {
+fn app() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
-    if args.len() == 1 {
-        print_help();
-        std::process::exit(-1);
-    }
 
     let config_path = Path::new(args[1].as_str());
     if !config_path.is_file() {
-        print_help();
-        std::process::exit(-1);
+        return Err(format!("Specified config must be a file"));
     }
 
     let base_directory = config_path.parent().unwrap();
 
     // read yaml config
-    let configs = match parse_configs(config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            log_err(e.as_str());
-            std::process::exit(-1);
-        }
-    };
+    let configs = parse_configs(config_path)?;
 
-    configs.iter().for_each(|config| {
+    configs.iter().map(|config| -> Result<(), String> {
         println!("Output: {}", config.output);
 
         let config_base = config.base.as_ref().map(|base| {
@@ -185,34 +228,56 @@ fn main() {
             None => base_directory
         };
 
-        if let Err(e) = create_header(base_directory, config) {
-            log_err(e.as_str());
-            std::process::exit(-1);
+        let mut header = create_header(base_directory, config)?;
+
+        let output = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(base_directory.join(config.output.as_str()));
+
+        let mut output = match output {
+            Ok(file) => file,
+            Err(e) => return Err(e.to_string())
+        };
+
+        // write header
+        let mut pos: usize = 0;
+        for i in 0..header.items.len() {
+            pos = header.items[i].write(pos, &mut output)?;
         }
-    });
 
-    // encode file
+        for i in 0..header.items.len() {
+            println!("{}", header.items[i].name.as_ref().unwrap());
 
-    let mut input_file = OpenOptions::new()
-        .read(true)
-        .open(args[1].as_str())
-        .expect("Unable to open file");
+            let mut input_file = OpenOptions::new()
+                .read(true)
+                .open(header.items[i].path.as_path())
+                .map_err(|e| e.to_string())?;
 
-    let output_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(format!("{}.pak", args[1]).as_str())
-        .expect("Unable to create output file");
+            let mut encoder = Encoder::new(output).unwrap();
+            io::copy(&mut input_file, &mut encoder).unwrap();
 
-    let mut encoder = Encoder::new(output_file).unwrap();
-    io::copy(&mut input_file, &mut encoder).unwrap();
+            output = encoder.finish()
+                .into_result().map_err(|_| "Unable to encode data")?;
+        }
 
-    let encoded_data = encoder.finish()
-        .into_result().expect("Unable to encode data");
+        Ok(())
+    }).collect::<Result<(), String>>()?;
+
+    Ok(())
 }
 
-fn log_err(error: &str) {
-    io::stderr().write(format!("Error: {}\n", error).as_bytes()).unwrap();
+fn main() {
+    if env::args().len() == 1 {
+        print_help();
+        std::process::exit(-1);
+    }
+
+    if let Err(e) = app() {
+        io::stderr().write(format!("Error: {}\n", e).as_bytes()).unwrap();
+        std::process::exit(-1);
+    }
 }
 
 fn print_help() {
